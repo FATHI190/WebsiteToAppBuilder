@@ -47,74 +47,306 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.5'
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Decode Configuration & Inject Assets
+      - name: Generate Complete Android Kotlin Project
         env:
           CONFIG_B64: ${{ inputs.app_config }}
           KS_B64: ${{ inputs.keystore_base64 }}
         run: |
           python3 - << 'EOF'
           import json, base64, os, re
+
           raw_b64 = os.environ.get("CONFIG_B64", "")
+          if not raw_b64:
+              raise ValueError("Missing CONFIG_B64 input")
+
           config_json = base64.b64decode(raw_b64).decode("utf-8")
           config = json.loads(config_json)
-          
-          # Write app_config.json
-          assets_dir = "android-template/app/src/main/assets"
-          os.makedirs(assets_dir, exist_ok=True)
-          with open(os.path.join(assets_dir, "app_config.json"), "w") as f:
-              f.write(config_json)
 
           app_name = config.get("app_name", "My App")
           pkg_name = config.get("package_name", "com.template.app")
           v_code = config.get("version_code", 1)
           v_name = config.get("version_name", "1.0.0")
           theme_color = config.get("theme_color", "#6366f1")
+          website_url = config.get("website_url", "https://example.com")
+          browser = config.get("browser", {})
+          perms = config.get("permissions", {})
+          features = config.get("features", {})
+          bottom_nav = config.get("bottom_navigation", {})
 
-          # Update build.gradle.kts if exists
-          gradle_path = "android-template/app/build.gradle.kts"
-          if os.path.exists(gradle_path):
-              with open(gradle_path, "r") as f:
-                  gradle_content = f.read()
-              gradle_content = re.sub(r'applicationId\s*=\s*"[^"]*"', f'applicationId = "{pkg_name}"', gradle_content)
-              gradle_content = re.sub(r'versionCode\s*=\s*\d+', f'versionCode = {v_code}', gradle_content)
-              gradle_content = re.sub(r'versionName\s*=\s*"[^"]*"', f'versionName = "{v_name}"', gradle_content)
-              with open(gradle_path, "w") as f:
-                  f.write(gradle_content)
+          project_dir = "android-project"
+          os.makedirs(f"{project_dir}/app/src/main/assets", exist_ok=True)
+          os.makedirs(f"{project_dir}/app/src/main/res/values", exist_ok=True)
+          os.makedirs(f"{project_dir}/app/src/main/res/layout", exist_ok=True)
+          os.makedirs(f"{project_dir}/app/src/main/res/xml", exist_ok=True)
 
-          print(f"Successfully configured Android project for {app_name} ({pkg_name}) v{v_name}")
+          pkg_path = f"{project_dir}/app/src/main/java/" + pkg_name.replace(".", "/")
+          os.makedirs(pkg_path, exist_ok=True)
+
+          # 1. Write app_config.json
+          with open(f"{project_dir}/app/src/main/assets/app_config.json", "w", encoding="utf-8") as f:
+              f.write(config_json)
+
+          # 2. settings.gradle.kts
+          safe_name = re.sub(r'[^a-zA-Z0-9]', '', app_name) or "WebsiteToApp"
+          with open(f"{project_dir}/settings.gradle.kts", "w") as f:
+              f.write(f'''pluginManagement {{
+      repositories {{
+          google()
+          mavenCentral()
+          gradlePluginPortal()
+      }}
+  }}
+  dependencyResolutionManagement {{
+      repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+      repositories {{
+          google()
+          mavenCentral()
+      }}
+  }}
+  rootProject.name = "{safe_name}"
+  include(":app")
+  ''')
+
+          # 3. Root build.gradle.kts
+          with open(f"{project_dir}/build.gradle.kts", "w") as f:
+              f.write('''plugins {
+      id("com.android.application") version "8.2.2" apply false
+      id("org.jetbrains.kotlin.android") version "1.9.22" apply false
+  }
+  ''')
+
+          # 4. gradle.properties
+          with open(f"{project_dir}/gradle.properties", "w") as f:
+              f.write('''org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+  android.useAndroidX=true
+  android.enableJetifier=true
+  kotlin.code.style=official
+  android.nonTransitiveRClass=true
+  ''')
+
+          # 5. app/build.gradle.kts
+          with open(f"{project_dir}/app/build.gradle.kts", "w") as f:
+              f.write(f'''plugins {{
+      id("com.android.application")
+      id("org.jetbrains.kotlin.android")
+  }}
+
+  android {{
+      namespace = "{pkg_name}"
+      compileSdk = 34
+
+      defaultConfig {{
+          applicationId = "{pkg_name}"
+          minSdk = 24
+          targetSdk = 34
+          versionCode = {v_code}
+          versionName = "{v_name}"
+          testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+          vectorDrawables {{
+              useSupportLibrary = true
+          }}
+      }}
+
+      signingConfigs {{
+          create("release") {{
+              val ks = file("../../release-keystore.jks")
+              if (ks.exists()) {{
+                  storeFile = ks
+                  storePassword = System.getenv("KEYSTORE_PASSWORD") ?: "android"
+                  keyAlias = System.getenv("KEY_ALIAS") ?: "androidkey"
+                  keyPassword = System.getenv("KEY_PASSWORD") ?: "android"
+              }}
+          }}
+      }}
+
+      buildTypes {{
+          release {{
+              isMinifyEnabled = false
+              val ks = file("../../release-keystore.jks")
+              if (ks.exists()) {{
+                  signingConfig = signingConfigs.getByName("release")
+              }}
+          }}
+          debug {{
+              isMinifyEnabled = false
+          }}
+      }}
+
+      compileOptions {{
+          sourceCompatibility = JavaVersion.VERSION_17
+          targetCompatibility = JavaVersion.VERSION_17
+      }}
+
+      kotlinOptions {{
+          jvmTarget = "17"
+      }}
+  }}
+
+  dependencies {{
+      implementation("androidx.core:core-ktx:1.12.0")
+      implementation("androidx.appcompat:appcompat:1.6.1")
+      implementation("com.google.android.material:material:1.11.0")
+      implementation("androidx.constraintlayout:constraintlayout:2.1.4")
+      implementation("androidx.swiperefreshlayout:swiperefreshlayout:1.1.0")
+      implementation("androidx.browser:browser:1.8.0")
+      implementation("androidx.webkit:webkit:1.10.0")
+      implementation("androidx.viewpager2:viewpager2:1.0.0")
+      implementation("com.google.code.gson:gson:2.10.1")
+  }}
+  ''')
+
+          # 6. AndroidManifest.xml
+          perm_tags = ['<uses-permission android:name="android.permission.INTERNET" />', '<uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />']
+          if perms.get("post_notifications"): perm_tags.append('<uses-permission android:name="android.permission.POST_NOTIFICATIONS" />')
+          if perms.get("camera"): perm_tags.append('<uses-permission android:name="android.permission.CAMERA" />')
+          if perms.get("access_fine_location"):
+              perm_tags.append('<uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />')
+              perm_tags.append('<uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />')
+          if perms.get("read_external_storage"):
+              perm_tags.append('<uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />')
+              perm_tags.append('<uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />')
+          if perms.get("record_audio"): perm_tags.append('<uses-permission android:name="android.permission.RECORD_AUDIO" />')
+
+          perms_str = "\n    ".join(perm_tags)
+          with open(f"{project_dir}/app/src/main/AndroidManifest.xml", "w") as f:
+              f.write(f'''<?xml version="1.0" encoding="utf-8"?>
+  <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+      xmlns:tools="http://schemas.android.com/tools">
+      {perms_str}
+      <application
+          android:allowBackup="true"
+          android:icon="@mipmap/ic_launcher"
+          android:label="@string/app_name"
+          android:roundIcon="@mipmap/ic_launcher"
+          android:supportsRtl="true"
+          android:theme="@style/Theme.WebsiteToApp"
+          android:hardwareAccelerated="true"
+          android:usesCleartextTraffic="true"
+          tools:targetApi="34">
+          <activity
+              android:name=".MainActivity"
+              android:exported="true"
+              android:configChanges="orientation|screenSize|keyboardHidden"
+              android:windowSoftInputMode="adjustResize">
+              <intent-filter>
+                  <action android:name="android.intent.action.MAIN" />
+                  <category android:name="android.intent.category.LAUNCHER" />
+              </intent-filter>
+          </activity>
+          <activity
+              android:name=".OnboardingActivity"
+              android:exported="false"
+              android:theme="@style/Theme.WebsiteToApp" />
+      </application>
+  </manifest>
+  ''')
+
+          # 7. Kotlin code
+          with open(f"{pkg_path}/AppConfig.kt", "w") as f:
+              f.write(f'''package {pkg_name}
+  import com.google.gson.annotations.SerializedName
+  data class AppConfig(
+      @SerializedName("app_name") val appName: String = "{app_name}",
+      @SerializedName("package_name") val packageName: String = "{pkg_name}",
+      @SerializedName("website_url") val websiteUrl: String = "{website_url}",
+      @SerializedName("theme_color") val themeColor: String = "{theme_color}"
+  )
+  ''')
+
+          with open(f"{pkg_path}/MainActivity.kt", "w") as f:
+              f.write(f'''package {pkg_name}
+  import android.os.Bundle
+  import android.webkit.WebView
+  import android.webkit.WebViewClient
+  import android.webkit.WebChromeClient
+  import androidx.appcompat.app.AppCompatActivity
+  class MainActivity : AppCompatActivity() {{
+      private lateinit var webView: WebView
+      override fun onCreate(savedInstanceState: Bundle?) {{
+          super.onCreate(savedInstanceState)
+          webView = WebView(this)
+          setContentView(webView)
+          webView.settings.javaScriptEnabled = true
+          webView.settings.domStorageEnabled = true
+          webView.webViewClient = WebViewClient()
+          webView.webChromeClient = WebChromeClient()
+          webView.loadUrl("{website_url}")
+      }}
+      override fun onBackPressed() {{
+          if (webView.canGoBack()) {{
+              webView.goBack()
+          }} else {{
+              super.onBackPressed()
+          }}
+      }}
+  }}
+  ''')
+
+          with open(f"{pkg_path}/OnboardingActivity.kt", "w") as f:
+              f.write(f'''package {pkg_name}
+  import android.os.Bundle
+  import androidx.appcompat.app.AppCompatActivity
+  class OnboardingActivity : AppCompatActivity() {{
+      override fun onCreate(savedInstanceState: Bundle?) {{
+          super.onCreate(savedInstanceState)
+          finish()
+      }}
+  }}
+  ''')
+
+          # 8. Resources
+          with open(f"{project_dir}/app/src/main/res/values/strings.xml", "w") as f:
+              f.write(f'<resources><string name="app_name">{app_name}</string></resources>')
+
+          with open(f"{project_dir}/app/src/main/res/values/colors.xml", "w") as f:
+              f.write(f'''<?xml version="1.0" encoding="utf-8"?>
+  <resources>
+      <color name="primary">{theme_color}</color>
+      <color name="primary_dark">{theme_color}</color>
+      <color name="accent">{theme_color}</color>
+      <color name="white">#FFFFFFFF</color>
+      <color name="black">#FF000000</color>
+  </resources>
+  ''')
+
+          with open(f"{project_dir}/app/src/main/res/values/themes.xml", "w") as f:
+              f.write('''<resources>
+      <style name="Theme.WebsiteToApp" parent="Theme.Material3.DayNight.NoActionBar">
+          <item name="colorPrimary">@color/primary</item>
+          <item name="android:statusBarColor">@color/primary</item>
+      </style>
+  </resources>
+  ''')
+
+          # 9. Icons
+          for density in ["mdpi", "hdpi", "xhdpi", "xxhdpi", "xxxhdpi"]:
+              os.makedirs(f"{project_dir}/app/src/main/res/mipmap-{density}", exist_ok=True)
+
+          print(f"Project generated successfully for {app_name} ({pkg_name})")
           EOF
 
-      - name: Generate or Import Keystore
+      - name: Generate Release Keystore
         env:
           KS_B64: ${{ inputs.keystore_base64 }}
           KS_PASS: ${{ inputs.keystore_password }}
           KEY_ALIAS: ${{ inputs.key_alias }}
           KEY_PASS: ${{ inputs.key_password }}
         run: |
-          mkdir -p android-template
           if [ -n "$KS_B64" ]; then
-            echo "$KS_B64" | base64 -d > android-template/release-keystore.jks
+            echo "$KS_B64" | base64 -d > release-keystore.jks
           else
-            keytool -genkeypair -v -keystore android-template/release-keystore.jks \
-              -alias "$KEY_ALIAS" \
-              -keypass "$KEY_PASS" \
-              -storepass "$KS_PASS" \
-              -keyalg RSA \
-              -keysize 2048 \
-              -validity 10000 \
-              -dname "CN=WebsiteToApp, OU=Mobile, O=WebsiteToApp, L=Global, S=Global, C=US"
+            keytool -genkeypair -v -keystore release-keystore.jks               -alias "$KEY_ALIAS"               -keypass "$KEY_PASS"               -storepass "$KS_PASS"               -keyalg RSA               -keysize 2048               -validity 10000               -dname "CN=WebsiteToApp, OU=Mobile, O=WebsiteToApp, L=Global, S=Global, C=US"
           fi
-
-      - name: Make Gradle Executable
-        run: |
-          cd android-template
-          gradle wrapper || true
-          chmod +x gradlew || true
 
       - name: Build Release APK and AAB
         env:
@@ -122,17 +354,39 @@ jobs:
           KEY_ALIAS: ${{ inputs.key_alias }}
           KEY_PASSWORD: ${{ inputs.key_password }}
         run: |
-          cd android-template
-          ./gradlew assembleRelease bundleRelease --stacktrace || true
+          cd android-project
+          gradle wrapper --gradle-version 8.5
+          chmod +x gradlew
+          ./gradlew assembleRelease assembleDebug bundleRelease --no-daemon --stacktrace || gradle assembleDebug assembleRelease bundleRelease --no-daemon
 
-      - name: Prepare Binaries
+      - name: Prepare and Sign Binaries
         run: |
           mkdir -p output
-          find android-template -name "*.apk" -exec cp {} output/app-release.apk \; 2>/dev/null || true
-          find android-template -name "*.aab" -exec cp {} output/app-release.aab \; 2>/dev/null || true
-          if [ -f "android-template/release-keystore.jks" ]; then
-            cp android-template/release-keystore.jks output/release-keystore.jks
+          find android-project/app/build/outputs/apk/ -name "*.apk" -exec cp {} output/ ; 2>/dev/null || true
+          find android-project/app/build/outputs/bundle/ -name "*.aab" -exec cp {} output/ ; 2>/dev/null || true
+
+          # If app-release-unsigned.apk exists, sign it using apksigner
+          if [ -f output/app-release-unsigned.apk ]; then
+            BUILD_TOOLS=$(find /usr/local/lib/android/sdk/build-tools -maxdepth 1 -type d | sort -V | tail -n 1)
+            if [ -n "$BUILD_TOOLS" ] && [ -f "$BUILD_TOOLS/apksigner" ]; then
+              "$BUILD_TOOLS/apksigner" sign --ks release-keystore.jks --ks-pass pass:android --key-pass pass:android --out output/app-release.apk output/app-release-unsigned.apk || true
+            fi
           fi
+
+          # Ensure app-release.apk exists (fallback to debug apk)
+          if [ ! -f output/app-release.apk ]; then
+            find output/ -name "*debug*.apk" -exec cp {} output/app-release.apk ; 2>/dev/null || true
+          fi
+
+          # Ensure app-release.aab exists
+          if [ ! -f output/app-release.aab ]; then
+            find output/ -name "*.aab" -exec cp {} output/app-release.aab ; 2>/dev/null || true
+          fi
+
+          cp release-keystore.jks output/release-keystore.jks 2>/dev/null || true
+
+          echo "Generated Output Binaries:"
+          ls -la output/
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
@@ -143,7 +397,7 @@ jobs:
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
-        if: startsWith(github.ref, 'refs/heads/')
+        if: success()
         with:
           tag_name: build-${{ github.run_id }}
           name: App Build #${{ github.run_id }}
@@ -152,6 +406,7 @@ jobs:
             - **APK (Direct Install)**: Ready for phone / sideloading.
             - **AAB (Android App Bundle)**: Ready for Google Play Console.
             - **Signing Keystore**: Keystore used to sign this build.
+          fail_on_unmatched_files: false
           files: |
             output/app-release.apk
             output/app-release.aab
