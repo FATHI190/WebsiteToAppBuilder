@@ -1,0 +1,160 @@
+name: Build Android APK and AAB
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_config:
+        description: 'Base64 encoded app_config.json'
+        required: true
+        type: string
+      keystore_base64:
+        description: 'Optional Base64 encoded release.keystore'
+        required: false
+        type: string
+      keystore_password:
+        description: 'Keystore password'
+        required: false
+        default: 'android'
+        type: string
+      key_alias:
+        description: 'Key alias'
+        required: false
+        default: 'androidkey'
+        type: string
+      key_password:
+        description: 'Key password'
+        required: false
+        default: 'android'
+        type: string
+
+jobs:
+  build:
+    name: Build & Sign Android App
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Decode Configuration & Inject Assets
+        env:
+          CONFIG_B64: ${{ inputs.app_config }}
+          KS_B64: ${{ inputs.keystore_base64 }}
+        run: |
+          python3 - << 'EOF'
+          import json, base64, os, re
+          raw_b64 = os.environ.get("CONFIG_B64", "")
+          config_json = base64.b64decode(raw_b64).decode("utf-8")
+          config = json.loads(config_json)
+          
+          # Write app_config.json
+          assets_dir = "android-template/app/src/main/assets"
+          os.makedirs(assets_dir, exist_ok=True)
+          with open(os.path.join(assets_dir, "app_config.json"), "w") as f:
+              f.write(config_json)
+
+          app_name = config.get("app_name", "My App")
+          pkg_name = config.get("package_name", "com.template.app")
+          v_code = config.get("version_code", 1)
+          v_name = config.get("version_name", "1.0.0")
+          theme_color = config.get("theme_color", "#6366f1")
+
+          # Update build.gradle.kts if exists
+          gradle_path = "android-template/app/build.gradle.kts"
+          if os.path.exists(gradle_path):
+              with open(gradle_path, "r") as f:
+                  gradle_content = f.read()
+              gradle_content = re.sub(r'applicationId\s*=\s*"[^"]*"', f'applicationId = "{pkg_name}"', gradle_content)
+              gradle_content = re.sub(r'versionCode\s*=\s*\d+', f'versionCode = {v_code}', gradle_content)
+              gradle_content = re.sub(r'versionName\s*=\s*"[^"]*"', f'versionName = "{v_name}"', gradle_content)
+              with open(gradle_path, "w") as f:
+                  f.write(gradle_content)
+
+          print(f"Successfully configured Android project for {app_name} ({pkg_name}) v{v_name}")
+          EOF
+
+      - name: Generate or Import Keystore
+        env:
+          KS_B64: ${{ inputs.keystore_base64 }}
+          KS_PASS: ${{ inputs.keystore_password }}
+          KEY_ALIAS: ${{ inputs.key_alias }}
+          KEY_PASS: ${{ inputs.key_password }}
+        run: |
+          mkdir -p android-template
+          if [ -n "$KS_B64" ]; then
+            echo "$KS_B64" | base64 -d > android-template/release-keystore.jks
+          else
+            keytool -genkeypair -v -keystore android-template/release-keystore.jks \
+              -alias "$KEY_ALIAS" \
+              -keypass "$KEY_PASS" \
+              -storepass "$KS_PASS" \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -dname "CN=WebsiteToApp, OU=Mobile, O=WebsiteToApp, L=Global, S=Global, C=US"
+          fi
+
+      - name: Make Gradle Executable
+        run: |
+          cd android-template
+          gradle wrapper || true
+          chmod +x gradlew || true
+
+      - name: Build Release APK and AAB
+        env:
+          KEYSTORE_PASSWORD: ${{ inputs.keystore_password }}
+          KEY_ALIAS: ${{ inputs.key_alias }}
+          KEY_PASSWORD: ${{ inputs.key_password }}
+        run: |
+          cd android-template
+          ./gradlew assembleRelease bundleRelease --stacktrace || true
+
+      - name: Prepare Binaries
+        run: |
+          mkdir -p output
+          find android-template -name "*.apk" -exec cp {} output/app-release.apk \; 2>/dev/null || true
+          find android-template -name "*.aab" -exec cp {} output/app-release.aab \; 2>/dev/null || true
+          if [ -f "android-template/release-keystore.jks" ]; then
+            cp android-template/release-keystore.jks output/release-keystore.jks
+          fi
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-binaries
+          path: output/*
+          if-no-files-found: warn
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/heads/')
+        with:
+          tag_name: build-${{ github.run_id }}
+          name: App Build #${{ github.run_id }}
+          body: |
+            ## Android Build Artifacts Ready!
+            - **APK (Direct Install)**: Ready for phone / sideloading.
+            - **AAB (Android App Bundle)**: Ready for Google Play Console.
+            - **Signing Keystore**: Keystore used to sign this build.
+          files: |
+            output/app-release.apk
+            output/app-release.aab
+            output/release-keystore.jks
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
